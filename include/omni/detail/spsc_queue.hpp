@@ -31,6 +31,7 @@ struct SPSCQueue {
     char padding2[CACHE_LINE_SIZE - sizeof(std::atomic<uint64_t>)];
     
     // Liveness tracking (separate cache line to avoid false sharing with indices)
+    // Initialize to true; handles set to false on destruction
     alignas(CACHE_LINE_SIZE) std::atomic<bool> producer_alive{true};
     alignas(CACHE_LINE_SIZE) std::atomic<bool> consumer_alive{true};
     

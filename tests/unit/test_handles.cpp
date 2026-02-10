@@ -77,15 +77,18 @@ TEST_F(ProducerHandleTestFixture, ReserveExceedsMaxSize) {
 TEST_F(ProducerHandleTestFixture, ReserveQueueFull) {
     auto producer = CreateTestProducer(4, 64);  // Capacity 4 = 3 usable slots
     
-    // Reserve 3 messages (fill the queue)
+    // Reserve and commit 3 messages (fill the queue)
     auto r1 = producer.Reserve(32);
-    EXPECT_TRUE(r1.has_value());
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_TRUE(producer.Commit(32));
     
     auto r2 = producer.Reserve(32);
-    EXPECT_TRUE(r2.has_value());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_TRUE(producer.Commit(32));
     
     auto r3 = producer.Reserve(32);
-    EXPECT_TRUE(r3.has_value());
+    ASSERT_TRUE(r3.has_value());
+    EXPECT_TRUE(producer.Commit(32));
     
     // Fourth reservation should fail (queue full)
     auto r4 = producer.Reserve(32);
@@ -95,9 +98,7 @@ TEST_F(ProducerHandleTestFixture, ReserveQueueFull) {
 // Test consumer_alive check
 TEST_F(ProducerHandleTestFixture, ReserveConsumerDead) {
     auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
-    queue->producer_alive.store(false, std::memory_order_release);  // Initialize as dead
-    auto producer = CreateTestProducer(16, 256);
-    auto test_queue = GetQueue(producer);  // Access queue through producer
+    auto producer = CreateTestProducerFromQueue(queue);
     
     // Mark consumer as dead
     queue->consumer_alive.store(false, std::memory_order_release);
@@ -324,13 +325,13 @@ TEST_F(ProducerHandleTestFixture, TryPushConsumerDead) {
 TEST_F(ProducerHandleTestFixture, Destructor) {
     auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
     
-    // producer_alive should be false initially
-    EXPECT_FALSE(queue->producer_alive.load(std::memory_order_acquire));
+    // producer_alive should be true initially (queue default)
+    EXPECT_TRUE(queue->producer_alive.load(std::memory_order_acquire));
     
     {
         auto producer = CreateTestProducerFromQueue(queue);
         
-        // producer_alive should be true after construction
+        // producer_alive should still be true (set by constructor)
         EXPECT_TRUE(queue->producer_alive.load(std::memory_order_acquire));
     }
     
@@ -477,3 +478,258 @@ TEST_F(ProducerHandleTestFixture, BlockingPushConsumerDead) {
     auto stats = producer.GetStats();
     EXPECT_EQ(stats.failed_pushes, 1);
 }
+
+// Test BatchPush with empty batch
+TEST_F(ProducerHandleTestFixture, BatchPushEmpty) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<std::span<const uint8_t>> messages;
+    size_t sent = producer.BatchPush(messages);
+    EXPECT_EQ(sent, 0);
+}
+
+// Test BatchPush success path
+TEST_F(ProducerHandleTestFixture, BatchPushSuccess) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Create test messages
+    std::vector<std::vector<uint8_t>> data = {
+        {1, 2, 3, 4},
+        {5, 6, 7, 8, 9},
+        {10, 11, 12}
+    };
+    
+    std::vector<std::span<const uint8_t>> spans;
+    for (const auto& msg : data) {
+        spans.emplace_back(msg.data(), msg.size());
+    }
+    
+    // BatchPush should succeed for all 3 messages
+    size_t sent = producer.BatchPush(spans);
+    EXPECT_EQ(sent, 3);
+    
+    // Verify write_index was advanced by 3
+    uint64_t write_index = queue->write_index.load(std::memory_order_acquire);
+    EXPECT_EQ(write_index, 3);
+    
+    // Verify stats were updated
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 3);
+    EXPECT_EQ(stats.bytes_sent, 12);  // 4 + 5 + 3 = 12 bytes
+    EXPECT_EQ(stats.failed_pushes, 0);
+    
+    // Verify first message
+    uint8_t* slot0 = queue->buffer.get();
+    uint32_t size0 = 0;
+    std::memcpy(&size0, slot0, 4);
+    EXPECT_EQ(size0, 4);
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(slot0[4 + i], data[0][i]);
+    }
+    
+    // Verify second message
+    uint8_t* slot1 = queue->buffer.get() + queue->slot_size;
+    uint32_t size1 = 0;
+    std::memcpy(&size1, slot1, 4);
+    EXPECT_EQ(size1, 5);
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(slot1[4 + i], data[1][i]);
+    }
+    
+    // Verify third message
+    uint8_t* slot2 = queue->buffer.get() + 2 * queue->slot_size;
+    uint32_t size2 = 0;
+    std::memcpy(&size2, slot2, 4);
+    EXPECT_EQ(size2, 3);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(slot2[4 + i], data[2][i]);
+    }
+}
+
+// Test BatchPush with invalid message (empty)
+TEST_F(ProducerHandleTestFixture, BatchPushInvalidEmpty) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<std::vector<uint8_t>> data = {
+        {1, 2, 3, 4},
+        {},  // Empty message
+        {5, 6, 7}
+    };
+    
+    std::vector<std::span<const uint8_t>> spans;
+    for (const auto& msg : data) {
+        spans.emplace_back(msg.data(), msg.size());
+    }
+    
+    // BatchPush should fail-fast and return 0
+    size_t sent = producer.BatchPush(spans);
+    EXPECT_EQ(sent, 0);
+    
+    // Verify no messages were sent
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 0);
+}
+
+// Test BatchPush with oversized message
+TEST_F(ProducerHandleTestFixture, BatchPushInvalidOversized) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<std::vector<uint8_t>> data = {
+        {1, 2, 3, 4},
+        std::vector<uint8_t>(257, 0xFF),  // Oversized
+        {5, 6, 7}
+    };
+    
+    std::vector<std::span<const uint8_t>> spans;
+    for (const auto& msg : data) {
+        spans.emplace_back(msg.data(), msg.size());
+    }
+    
+    // BatchPush should fail-fast and return 0
+    size_t sent = producer.BatchPush(spans);
+    EXPECT_EQ(sent, 0);
+    
+    // Verify no messages were sent
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 0);
+}
+
+// Test BatchPush with consumer dead
+TEST_F(ProducerHandleTestFixture, BatchPushConsumerDead) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Mark consumer as dead
+    queue->consumer_alive.store(false, std::memory_order_release);
+    
+    std::vector<std::vector<uint8_t>> data = {
+        {1, 2, 3, 4},
+        {5, 6, 7, 8}
+    };
+    
+    std::vector<std::span<const uint8_t>> spans;
+    for (const auto& msg : data) {
+        spans.emplace_back(msg.data(), msg.size());
+    }
+    
+    // BatchPush should return 0
+    size_t sent = producer.BatchPush(spans);
+    EXPECT_EQ(sent, 0);
+    
+    // Verify no messages were sent
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 0);
+}
+
+// Test BatchPush partial success (queue fills up)
+TEST_F(ProducerHandleTestFixture, BatchPushPartial) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(4, 64);  // Capacity 4 = 3 usable slots
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Try to push 5 messages, but queue can only hold 3
+    std::vector<std::vector<uint8_t>> data;
+    for (int i = 0; i < 5; ++i) {
+        data.push_back({static_cast<uint8_t>(i), static_cast<uint8_t>(i + 1)});
+    }
+    
+    std::vector<std::span<const uint8_t>> spans;
+    for (const auto& msg : data) {
+        spans.emplace_back(msg.data(), msg.size());
+    }
+    
+    // BatchPush should send 3 messages and stop
+    size_t sent = producer.BatchPush(spans);
+    EXPECT_EQ(sent, 3);
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 3);
+    EXPECT_EQ(stats.bytes_sent, 6);  // 2 bytes × 3 messages
+    
+    // Verify write_index
+    uint64_t write_index = queue->write_index.load(std::memory_order_acquire);
+    EXPECT_EQ(write_index, 3);
+}
+
+// Test BatchPush performance benefit (single notification)
+TEST_F(ProducerHandleTestFixture, BatchPushPerformance) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(128, 64);
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Create 100 small messages
+    std::vector<std::vector<uint8_t>> data;
+    for (int i = 0; i < 100; ++i) {
+        data.push_back({static_cast<uint8_t>(i), static_cast<uint8_t>(i + 1)});
+    }
+    
+    std::vector<std::span<const uint8_t>> spans;
+    for (const auto& msg : data) {
+        spans.emplace_back(msg.data(), msg.size());
+    }
+    
+    // Measure BatchPush time
+    auto start_batch = std::chrono::high_resolution_clock::now();
+    size_t sent = producer.BatchPush(spans);
+    auto end_batch = std::chrono::high_resolution_clock::now();
+    auto batch_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_batch - start_batch);
+    
+    EXPECT_EQ(sent, 100);
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 100);
+    EXPECT_EQ(stats.bytes_sent, 200);  // 2 bytes × 100 messages
+    
+    // Performance check: BatchPush should be significantly faster than individual pushes
+    // For 100 messages, batch should complete in less time due to single notification
+    // This is a qualitative test - the actual speedup depends on hardware
+    // but we can at least verify the operation completed successfully
+    EXPECT_GT(batch_duration.count(), 0);  // Ensure measurement is valid
+    
+    // Note: The key performance benefit is the single notify_one() call
+    // instead of 100 notify_one() calls (amortization of synchronization overhead)
+}
+
+// Test BatchPush wraparound in ring buffer
+TEST_F(ProducerHandleTestFixture, BatchPushWraparound) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(8, 64);  // Capacity 8
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Push 6 messages normally
+    std::vector<std::vector<uint8_t>> data1;
+    for (int i = 0; i < 6; ++i) {
+        data1.push_back({static_cast<uint8_t>(i)});
+    }
+    
+    std::vector<std::span<const uint8_t>> spans1;
+    for (const auto& msg : data1) {
+        spans1.emplace_back(msg.data(), msg.size());
+    }
+    
+    size_t sent1 = producer.BatchPush(spans1);
+    EXPECT_EQ(sent1, 6);
+    
+    // Simulate consumer reading 4 messages
+    queue->read_index.store(4, std::memory_order_release);
+    
+    // Now push 3 more messages (should wrap around)
+    std::vector<std::vector<uint8_t>> data2;
+    for (int i = 6; i < 9; ++i) {
+        data2.push_back({static_cast<uint8_t>(i)});
+    }
+    
+    std::vector<std::span<const uint8_t>> spans2;
+    for (const auto& msg : data2) {
+        spans2.emplace_back(msg.data(), msg.size());
+    }
+    
+    size_t sent2 = producer.BatchPush(spans2);
+    EXPECT_EQ(sent2, 3);
+    
+    // Verify total stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 9);
+    EXPECT_EQ(stats.bytes_sent, 9);  // 1 byte × 9 messages
+}
+
