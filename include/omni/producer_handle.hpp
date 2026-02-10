@@ -107,10 +107,21 @@ public:
     ProducerHandle(const ProducerHandle&) = delete;
     ProducerHandle& operator=(const ProducerHandle&) = delete;
 
+#ifndef NDEBUG
+    // ===== TEST-ONLY METHODS (Debug builds only) =====
+    // WARNING: These methods expose internal state for testing.
+    // Do NOT use in production code.
+    
+    // Create handle for testing (bypasses broker)
+    [[nodiscard]] static ProducerHandle CreateForTesting_(std::shared_ptr<detail::SPSCQueue> queue);
+    
+    // Get internal queue (for unit testing only)
+    [[nodiscard]] std::shared_ptr<detail::SPSCQueue> GetQueueForTesting_() const noexcept;
+#endif
+
 private:
-friend class MailboxBroker;
-friend class ProducerHandleTestFixture;  // For testing
-explicit ProducerHandle(std::shared_ptr<detail::SPSCQueue> queue);
+    friend class MailboxBroker;
+    explicit ProducerHandle(std::shared_ptr<detail::SPSCQueue> queue);
     
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

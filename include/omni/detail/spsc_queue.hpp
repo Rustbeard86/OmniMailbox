@@ -15,6 +15,12 @@ namespace omni::detail {
     constexpr size_t CACHE_LINE_SIZE = 64;
 #endif
 
+// Suppress MSVC warning about intentional padding for cache-line alignment
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4324)  // Structure was padded due to alignment specifier
+#endif
+
 struct SPSCQueue {
     // Producer-owned cache line (relaxed for own index, acquire for remote)
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index{0};
@@ -54,5 +60,9 @@ private:
 };
 
 } // namespace omni::detail
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #endif // OMNI_DETAIL_SPSC_QUEUE_HPP

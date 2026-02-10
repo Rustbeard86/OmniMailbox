@@ -41,6 +41,25 @@ ProducerHandle::ProducerHandle(std::shared_ptr<detail::SPSCQueue> queue)
 {
 }
 
+#ifndef NDEBUG
+// Test-only factory method (debug builds only)
+ProducerHandle ProducerHandle::CreateForTesting_(std::shared_ptr<detail::SPSCQueue> queue) {
+    return ProducerHandle(std::move(queue));
+}
+
+// Test helper: Get internal queue (for testing only)
+std::shared_ptr<detail::SPSCQueue> ProducerHandle::GetQueueForTesting_() const noexcept {
+    return pimpl_ ? pimpl_->queue_ : nullptr;
+}
+#endif
+
+// ReserveResult destructor (RAII cleanup)
+ProducerHandle::ReserveResult::~ReserveResult() {
+    // Auto-rollback is handled by producer's Rollback()
+    // This destructor exists to satisfy the declaration
+    // The actual rollback logic is in ProducerHandle::Rollback()
+}
+
 std::optional<ProducerHandle::ReserveResult> ProducerHandle::Reserve(size_t bytes) noexcept {
     // 1. Validate preconditions
     if (bytes == 0) {
@@ -131,6 +150,81 @@ bool ProducerHandle::Commit(size_t actual_bytes) noexcept {
     return true;
 }
 
+void ProducerHandle::Rollback() noexcept {
+    // Clear reserved_slot without advancing write_index
+    pimpl_->reserved_slot_.reset();
+}
+
+PushResult ProducerHandle::TryPush(std::span<const uint8_t> data) noexcept {
+    // 1. Validate preconditions
+    if (data.empty()) {
+        return PushResult::InvalidSize;
+    }
+    
+    if (data.size() > pimpl_->queue_->max_message_size) {
+        return PushResult::InvalidSize;
+    }
+    
+    // 2. Check if consumer is alive
+    if (!pimpl_->queue_->consumer_alive.load(std::memory_order_relaxed)) {
+        pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+        return PushResult::ChannelClosed;
+    }
+    
+    // 3. Reserve space
+    auto result = Reserve(data.size());
+    if (!result.has_value()) {
+        pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+        return PushResult::QueueFull;
+    }
+    
+    // 4. Copy data into reserved space
+    std::memcpy(result->data, data.data(), data.size());
+    
+    // 5. Commit the message
+    bool committed = Commit(data.size());
+    if (!committed) {
+        // This should never happen if Reserve succeeded
+        pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+        return PushResult::QueueFull;
+    }
+    
+    return PushResult::Success;
+}
+
+bool ProducerHandle::IsConnected() const noexcept {
+    // Check consumer_alive flag (relaxed read)
+    return pimpl_->queue_->consumer_alive.load(std::memory_order_relaxed);
+}
+
+size_t ProducerHandle::Capacity() const noexcept {
+    return pimpl_->queue_->capacity;
+}
+
+size_t ProducerHandle::MaxMessageSize() const noexcept {
+    return pimpl_->queue_->max_message_size;
+}
+
+size_t ProducerHandle::AvailableSlots() const noexcept {
+    // Approximate calculation using indices (relaxed reads)
+    const uint64_t write = pimpl_->queue_->write_index.load(std::memory_order_relaxed);
+    const uint64_t read = pimpl_->queue_->read_index.load(std::memory_order_relaxed);
+    const uint64_t mask = pimpl_->queue_->capacity - 1;
+    
+    // Calculate used slots
+    const uint64_t used = (write - read) & mask;
+    
+    // Available = capacity - used - 1 (leave 1 slot empty to distinguish full/empty)
+    return pimpl_->queue_->capacity - used - 1;
+}
+
+ChannelConfig ProducerHandle::GetConfig() const noexcept {
+    return ChannelConfig{
+        .capacity = pimpl_->queue_->capacity,
+        .max_message_size = pimpl_->queue_->max_message_size
+    };
+}
+
 ProducerHandle::Stats ProducerHandle::GetStats() const noexcept {
     return Stats{
         .messages_sent = pimpl_->messages_sent_.load(std::memory_order_relaxed),
@@ -138,5 +232,22 @@ ProducerHandle::Stats ProducerHandle::GetStats() const noexcept {
         .failed_pushes = pimpl_->failed_pushes_.load(std::memory_order_relaxed)
     };
 }
+
+ProducerHandle::~ProducerHandle() noexcept {
+    if (pimpl_ && pimpl_->queue_) {
+        // CRITICAL: Destruction barrier (seq_cst fence before signaling death)
+        // Ensures all previous writes are visible before setting producer_alive to false
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        
+        // Signal producer is dead (release semantics)
+        pimpl_->queue_->producer_alive.store(false, std::memory_order_release);
+        
+        // Wake blocked consumer
+        pimpl_->queue_->write_index.notify_one();
+    }
+}
+
+ProducerHandle::ProducerHandle(ProducerHandle&&) noexcept = default;
+ProducerHandle& ProducerHandle::operator=(ProducerHandle&&) noexcept = default;
 
 } // namespace omni

@@ -10,8 +10,16 @@ protected:
     // Helper to create a ProducerHandle for testing
     static omni::ProducerHandle CreateTestProducer(size_t capacity = 16, size_t max_msg_size = 256) {
         auto queue = std::make_shared<omni::detail::SPSCQueue>(capacity, max_msg_size);
-        // Call private constructor - this requires friend access
-        return omni::ProducerHandle(queue);
+        return omni::ProducerHandle::CreateForTesting_(queue);
+    }
+    
+    static omni::ProducerHandle CreateTestProducerFromQueue(std::shared_ptr<omni::detail::SPSCQueue> queue) {
+        return omni::ProducerHandle::CreateForTesting_(queue);
+    }
+    
+    // Helper to get the queue from a producer (for testing purposes)
+    static std::shared_ptr<omni::detail::SPSCQueue> GetQueue(omni::ProducerHandle& producer) {
+        return producer.GetQueueForTesting_();
     }
 };
 
@@ -86,7 +94,9 @@ TEST_F(ProducerHandleTestFixture, ReserveQueueFull) {
 // Test consumer_alive check
 TEST_F(ProducerHandleTestFixture, ReserveConsumerDead) {
     auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
-    auto producer = omni::ProducerHandle(queue);
+    queue->producer_alive.store(false, std::memory_order_release);  // Initialize as dead
+    auto producer = CreateTestProducer(16, 256);
+    auto test_queue = GetQueue(producer);  // Access queue through producer
     
     // Mark consumer as dead
     queue->consumer_alive.store(false, std::memory_order_release);
@@ -111,8 +121,8 @@ TEST_F(ProducerHandleTestFixture, ReserveMultipleWithoutCommit) {
 
 // Test full Reserve->Commit cycle
 TEST_F(ProducerHandleTestFixture, ReserveCommit) {
-    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
-    auto producer = omni::ProducerHandle(queue);
+    auto producer = CreateTestProducer(16, 256);
+    auto queue = GetQueue(producer);  // Access queue through producer
     
     // Reserve space
     auto result = producer.Reserve(128);
@@ -213,7 +223,154 @@ TEST_F(ProducerHandleTestFixture, CommitUpdatesStats) {
     EXPECT_EQ(stats.bytes_sent, 96);
 }
 
-// Placeholder for handle tests
-TEST(HandlesTest, Placeholder) {
-    EXPECT_TRUE(true);
+// Test TryPush success path
+TEST_F(ProducerHandleTestFixture, TryPushSuccess) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Create test data
+    std::vector<uint8_t> data = {1, 2, 3, 4, 5, 6, 7, 8};
+    
+    // TryPush should succeed
+    auto result = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(result, omni::PushResult::Success);
+    
+    // Verify write_index was advanced
+    uint64_t write_index = queue->write_index.load(std::memory_order_acquire);
+    EXPECT_EQ(write_index, 1);
+    
+    // Verify size prefix was written correctly
+    uint8_t* slot = queue->buffer.get();
+    uint32_t size_prefix = 0;
+    std::memcpy(&size_prefix, slot, 4);
+    EXPECT_EQ(size_prefix, 8);
+    
+    // Verify payload data
+    for (size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(slot[4 + i], data[i]);
+    }
+    
+    // Verify stats were updated
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 1);
+    EXPECT_EQ(stats.bytes_sent, 8);
+    EXPECT_EQ(stats.failed_pushes, 0);
+}
+
+// Test TryPush when queue is full
+TEST_F(ProducerHandleTestFixture, TryPushFull) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(4, 64);  // Capacity 4 = 3 usable slots
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Fill the queue with 3 messages
+    std::vector<uint8_t> data = {1, 2, 3, 4};
+    
+    auto r1 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r1, omni::PushResult::Success);
+    
+    auto r2 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r2, omni::PushResult::Success);
+    
+    auto r3 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r3, omni::PushResult::Success);
+    
+    // Fourth push should fail with QueueFull
+    auto r4 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r4, omni::PushResult::QueueFull);
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 3);
+    EXPECT_EQ(stats.failed_pushes, 1);
+}
+
+// Test TryPush with empty data
+TEST_F(ProducerHandleTestFixture, TryPushEmptyData) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<uint8_t> data;
+    auto result = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(result, omni::PushResult::InvalidSize);
+}
+
+// Test TryPush with oversized data
+TEST_F(ProducerHandleTestFixture, TryPushOversized) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<uint8_t> data(257, 0xFF);
+    auto result = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(result, omni::PushResult::InvalidSize);
+}
+
+// Test TryPush when consumer is dead
+TEST_F(ProducerHandleTestFixture, TryPushConsumerDead) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Mark consumer as dead
+    queue->consumer_alive.store(false, std::memory_order_release);
+    
+    std::vector<uint8_t> data = {1, 2, 3, 4};
+    auto result = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(result, omni::PushResult::ChannelClosed);
+    
+    // Verify failed_pushes was incremented
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.failed_pushes, 1);
+}
+
+// Test Destructor cleanup
+TEST_F(ProducerHandleTestFixture, Destructor) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    
+    // producer_alive should be false initially
+    EXPECT_FALSE(queue->producer_alive.load(std::memory_order_acquire));
+    
+    {
+        auto producer = CreateTestProducerFromQueue(queue);
+        
+        // producer_alive should be true after construction
+        EXPECT_TRUE(queue->producer_alive.load(std::memory_order_acquire));
+    }
+    
+    // producer_alive should be false after destruction
+    EXPECT_FALSE(queue->producer_alive.load(std::memory_order_acquire));
+}
+
+// Test Rollback clears reservation
+TEST_F(ProducerHandleTestFixture, RollbackClearsReservation) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    // Reserve space
+    auto result = producer.Reserve(128);
+    ASSERT_TRUE(result.has_value());
+    
+    // Rollback should clear the reservation
+    producer.Rollback();
+    
+    // Should be able to reserve again after rollback
+    auto result2 = producer.Reserve(64);
+    EXPECT_TRUE(result2.has_value());
+}
+
+// Test query methods
+TEST_F(ProducerHandleTestFixture, QueryMethods) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    // Test Capacity()
+    EXPECT_EQ(producer.Capacity(), 16);
+    
+    // Test MaxMessageSize()
+    EXPECT_EQ(producer.MaxMessageSize(), 256);
+    
+    // Test IsConnected() - should be true initially
+    EXPECT_TRUE(producer.IsConnected());
+    
+    // Test AvailableSlots() - should be capacity - 1 when empty
+    EXPECT_EQ(producer.AvailableSlots(), 15);
+    
+    // Test GetConfig()
+    auto config = producer.GetConfig();
+    EXPECT_EQ(config.capacity, 16);
+    EXPECT_EQ(config.max_message_size, 256);
 }
