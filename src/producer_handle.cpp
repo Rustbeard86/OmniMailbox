@@ -3,6 +3,7 @@
 #include <atomic>
 #include <optional>
 #include <limits>
+#include <chrono>
 
 namespace omni {
 
@@ -153,6 +154,68 @@ bool ProducerHandle::Commit(size_t actual_bytes) noexcept {
 void ProducerHandle::Rollback() noexcept {
     // Clear reserved_slot without advancing write_index
     pimpl_->reserved_slot_.reset();
+}
+
+PushResult ProducerHandle::BlockingPush(
+    std::span<const uint8_t> data,
+    std::chrono::milliseconds timeout) noexcept 
+{
+    // 1. Validate preconditions
+    if (data.empty()) {
+        pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+        return PushResult::InvalidSize;
+    }
+    
+    if (data.size() > pimpl_->queue_->max_message_size) {
+        pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+        return PushResult::InvalidSize;
+    }
+    
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    
+    while (true) {
+        // 2. Check if consumer is alive
+        if (!pimpl_->queue_->consumer_alive.load(std::memory_order_relaxed)) {
+            pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+            return PushResult::ChannelClosed;
+        }
+        
+        // 3. Try Reserve
+        auto result = Reserve(data.size());
+        if (result.has_value()) {
+            // 4. Copy data into reserved space
+            std::memcpy(result->data, data.data(), data.size());
+            
+            // 5. Commit the message
+            bool committed = Commit(data.size());
+            if (!committed) {
+                // This should never happen if Reserve succeeded
+                pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+                return PushResult::QueueFull;
+            }
+            
+            return PushResult::Success;
+        }
+        
+        // 6. Check timeout
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            pimpl_->failed_pushes_.fetch_add(1, std::memory_order_relaxed);
+            return PushResult::Timeout;
+        }
+        
+        // 7. Wait for notification (with spurious wakeup protection)
+        const uint64_t current_read = pimpl_->queue_->read_index.load(std::memory_order_acquire);
+        const uint64_t current_write = pimpl_->queue_->write_index.load(std::memory_order_relaxed);
+        
+        const uint64_t mask = pimpl_->queue_->capacity - 1;
+        if (((current_write + 1) & mask) != (current_read & mask)) {
+            continue;  // Space became available, retry
+        }
+        
+        // Wait until read_index changes (consumer pops a message)
+        pimpl_->queue_->read_index.wait(current_read, std::memory_order_acquire);
+    }
 }
 
 PushResult ProducerHandle::TryPush(std::span<const uint8_t> data) noexcept {

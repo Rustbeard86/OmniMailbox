@@ -3,6 +3,7 @@
 #include "omni/detail/spsc_queue.hpp"
 #include <memory>
 #include <limits>
+#include <chrono>
 
 // Test fixture with friend access to ProducerHandle
 class ProducerHandleTestFixture : public ::testing::Test {
@@ -373,4 +374,106 @@ TEST_F(ProducerHandleTestFixture, QueryMethods) {
     auto config = producer.GetConfig();
     EXPECT_EQ(config.capacity, 16);
     EXPECT_EQ(config.max_message_size, 256);
+}
+
+// Test BlockingPush with timeout
+TEST_F(ProducerHandleTestFixture, BlockingPushTimeout) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(4, 64);  // Capacity 4 = 3 usable slots
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Fill the queue with 3 messages
+    std::vector<uint8_t> data = {1, 2, 3, 4};
+    
+    auto r1 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r1, omni::PushResult::Success);
+    
+    auto r2 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r2, omni::PushResult::Success);
+    
+    auto r3 = producer.TryPush(std::span<const uint8_t>(data));
+    EXPECT_EQ(r3, omni::PushResult::Success);
+    
+    // Now queue is full, BlockingPush should timeout
+    auto start = std::chrono::steady_clock::now();
+    auto result = producer.BlockingPush(std::span<const uint8_t>(data), std::chrono::milliseconds(100));
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    
+    EXPECT_EQ(result, omni::PushResult::Timeout);
+    EXPECT_GE(elapsed.count(), 100);  // Should have waited at least 100ms
+    EXPECT_LT(elapsed.count(), 200);  // But not too much longer
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 3);
+    EXPECT_EQ(stats.failed_pushes, 1);  // Timeout counts as failed push
+}
+
+// Test BlockingPush success after space becomes available
+TEST_F(ProducerHandleTestFixture, BlockingPushSuccess) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(4, 64);  // Capacity 4 = 3 usable slots
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Fill the queue with 3 messages
+    std::vector<uint8_t> data = {1, 2, 3, 4};
+    
+    producer.TryPush(std::span<const uint8_t>(data));
+    producer.TryPush(std::span<const uint8_t>(data));
+    producer.TryPush(std::span<const uint8_t>(data));
+    
+    // Simulate consumer reading one message by advancing read_index
+    queue->read_index.store(1, std::memory_order_release);
+    queue->read_index.notify_one();
+    
+    // Now BlockingPush should succeed immediately
+    auto result = producer.BlockingPush(std::span<const uint8_t>(data), std::chrono::milliseconds(1000));
+    EXPECT_EQ(result, omni::PushResult::Success);
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 4);
+    EXPECT_EQ(stats.failed_pushes, 0);
+}
+
+// Test BlockingPush with empty data
+TEST_F(ProducerHandleTestFixture, BlockingPushEmptyData) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<uint8_t> data;
+    auto result = producer.BlockingPush(std::span<const uint8_t>(data), std::chrono::milliseconds(100));
+    EXPECT_EQ(result, omni::PushResult::InvalidSize);
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.failed_pushes, 1);
+}
+
+// Test BlockingPush with oversized data
+TEST_F(ProducerHandleTestFixture, BlockingPushOversized) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    std::vector<uint8_t> data(257, 0xFF);
+    auto result = producer.BlockingPush(std::span<const uint8_t>(data), std::chrono::milliseconds(100));
+    EXPECT_EQ(result, omni::PushResult::InvalidSize);
+    
+    // Verify stats
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.failed_pushes, 1);
+}
+
+// Test BlockingPush when consumer is dead
+TEST_F(ProducerHandleTestFixture, BlockingPushConsumerDead) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    auto producer = CreateTestProducerFromQueue(queue);
+    
+    // Mark consumer as dead
+    queue->consumer_alive.store(false, std::memory_order_release);
+    
+    std::vector<uint8_t> data = {1, 2, 3, 4};
+    auto result = producer.BlockingPush(std::span<const uint8_t>(data), std::chrono::milliseconds(100));
+    EXPECT_EQ(result, omni::PushResult::ChannelClosed);
+    
+    // Verify failed_pushes was incremented
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.failed_pushes, 1);
 }
