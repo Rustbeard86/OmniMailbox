@@ -109,6 +109,110 @@ TEST_F(ProducerHandleTestFixture, ReserveMultipleWithoutCommit) {
     EXPECT_FALSE(r2.has_value());
 }
 
+// Test full Reserve->Commit cycle
+TEST_F(ProducerHandleTestFixture, ReserveCommit) {
+    auto queue = std::make_shared<omni::detail::SPSCQueue>(16, 256);
+    auto producer = omni::ProducerHandle(queue);
+    
+    // Reserve space
+    auto result = producer.Reserve(128);
+    ASSERT_TRUE(result.has_value());
+    
+    // Write some test data to the reserved space
+    uint8_t* data = result->data;
+    for (size_t i = 0; i < 64; ++i) {
+        data[i] = static_cast<uint8_t>(i);
+    }
+    
+    // Commit with 64 bytes (less than reserved 128)
+    bool committed = producer.Commit(64);
+    EXPECT_TRUE(committed);
+    
+    // Verify write_index was advanced
+    uint64_t write_index = queue->write_index.load(std::memory_order_acquire);
+    EXPECT_EQ(write_index, 1);
+    
+    // Verify size prefix was written correctly
+    uint8_t* slot = queue->buffer.get();
+    uint32_t size_prefix = 0;
+    std::memcpy(&size_prefix, slot, 4);
+    EXPECT_EQ(size_prefix, 64);
+    
+    // Verify payload data
+    for (size_t i = 0; i < 64; ++i) {
+        EXPECT_EQ(slot[4 + i], static_cast<uint8_t>(i));
+    }
+    
+    // Should be able to reserve again after commit
+    auto result2 = producer.Reserve(64);
+    EXPECT_TRUE(result2.has_value());
+}
+
+// Test Commit with zero bytes (should fail)
+TEST_F(ProducerHandleTestFixture, CommitZeroBytes) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    // Reserve space
+    auto result = producer.Reserve(128);
+    ASSERT_TRUE(result.has_value());
+    
+    // Commit with 0 bytes should fail
+    bool committed = producer.Commit(0);
+    EXPECT_FALSE(committed);
+}
+
+// Test Commit exceeding max_message_size (should fail)
+TEST_F(ProducerHandleTestFixture, CommitExceedsMaxSize) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    // Reserve space
+    auto result = producer.Reserve(128);
+    ASSERT_TRUE(result.has_value());
+    
+    // Commit with more than max_message_size should fail
+    bool committed = producer.Commit(257);
+    EXPECT_FALSE(committed);
+}
+
+// Test Commit without Reserve (should fail)
+TEST_F(ProducerHandleTestFixture, CommitWithoutReserve) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    // Commit without reserving should fail
+    bool committed = producer.Commit(64);
+    EXPECT_FALSE(committed);
+}
+
+// Test Commit updates statistics
+TEST_F(ProducerHandleTestFixture, CommitUpdatesStats) {
+    auto producer = CreateTestProducer(16, 256);
+    
+    // Initial stats should be zero
+    auto stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 0);
+    EXPECT_EQ(stats.bytes_sent, 0);
+    
+    // Reserve and commit
+    auto result = producer.Reserve(128);
+    ASSERT_TRUE(result.has_value());
+    producer.Commit(64);
+    
+    // Check updated stats
+    stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 1);
+    EXPECT_EQ(stats.bytes_sent, 64);
+    
+    // Reserve and commit again
+    auto result2 = producer.Reserve(128);
+    ASSERT_TRUE(result2.has_value());
+    producer.Commit(32);
+    
+    // Check cumulative stats
+    stats = producer.GetStats();
+    EXPECT_EQ(stats.messages_sent, 2);
+    EXPECT_EQ(stats.bytes_sent, 96);
+}
+
 // Placeholder for handle tests
 TEST(HandlesTest, Placeholder) {
     EXPECT_TRUE(true);

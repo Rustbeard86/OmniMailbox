@@ -89,4 +89,54 @@ std::optional<ProducerHandle::ReserveResult> ProducerHandle::Reserve(size_t byte
     };
 }
 
+bool ProducerHandle::Commit(size_t actual_bytes) noexcept {
+    // 1. Validate preconditions
+    if (actual_bytes == 0) {
+        return false;  // actual_bytes must be > 0
+    }
+    
+    if (actual_bytes > pimpl_->queue_->max_message_size) {
+        return false;  // actual_bytes exceeds max_message_size
+    }
+    
+    if (!pimpl_->reserved_slot_.has_value()) {
+        return false;  // No active reservation
+    }
+    
+    // 2. Write size prefix to slot
+    const size_t slot_index = pimpl_->reserved_slot_.value();
+    uint8_t* slot = pimpl_->queue_->buffer.get() + (slot_index * pimpl_->queue_->slot_size);
+    
+    // Write 4-byte size prefix (little-endian)
+    const uint32_t size_prefix = static_cast<uint32_t>(actual_bytes);
+    std::memcpy(slot, &size_prefix, 4);
+    
+    // 3. Load write_index (relaxed - own index)
+    const uint64_t write = pimpl_->queue_->write_index.load(std::memory_order_relaxed);
+    
+    // 4. Store write_index + 1 (release) - ensures size + payload writes visible
+    // Release fence ensures size + payload writes visible
+    pimpl_->queue_->write_index.store(write + 1, std::memory_order_release);
+    
+    // 5. Call notify_one() on write_index
+    pimpl_->queue_->write_index.notify_one();
+    
+    // 6. Update statistics (relaxed)
+    pimpl_->messages_sent_.fetch_add(1, std::memory_order_relaxed);
+    pimpl_->bytes_sent_.fetch_add(actual_bytes, std::memory_order_relaxed);
+    
+    // 7. Clear reserved_slot
+    pimpl_->reserved_slot_.reset();
+    
+    return true;
+}
+
+ProducerHandle::Stats ProducerHandle::GetStats() const noexcept {
+    return Stats{
+        .messages_sent = pimpl_->messages_sent_.load(std::memory_order_relaxed),
+        .bytes_sent = pimpl_->bytes_sent_.load(std::memory_order_relaxed),
+        .failed_pushes = pimpl_->failed_pushes_.load(std::memory_order_relaxed)
+    };
+}
+
 } // namespace omni
