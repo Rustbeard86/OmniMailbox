@@ -20,8 +20,19 @@ elseif(UNIX)
     add_compile_definitions(OMNI_PLATFORM_LINUX)
 endif()
 
-# Dependencies
-find_package(flatbuffers REQUIRED)
+# Dependencies - Use FetchContent to automatically download
+include(FetchContent)
+
+# Flatbuffers
+FetchContent_Declare(
+    flatbuffers
+    GIT_REPOSITORY https://github.com/google/flatbuffers.git
+    GIT_TAG v24.3.25
+    GIT_SHALLOW TRUE
+)
+set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(flatbuffers)
 
 # Library target
 if(OMNI_HEADER_ONLY)
@@ -34,7 +45,7 @@ else()
         src/consumer_handle.cpp
     )
     target_include_directories(omni-mailbox PUBLIC include/)
-    target_link_libraries(omni-mailbox PUBLIC flatbuffers::flatbuffers)
+    target_link_libraries(omni-mailbox PUBLIC flatbuffers)
 endif()
 
 # Compiler warnings (strict)
@@ -61,9 +72,20 @@ endif()
 # Tests
 if(OMNI_BUILD_TESTS)
     enable_testing()
-    find_package(GTest REQUIRED)
+    
+    # Fetch GoogleTest
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.15.2
+        GIT_SHALLOW TRUE
+    )
+    # For Windows: Prevent overriding the parent project's compiler/linker settings
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
     
     add_executable(omni-tests
+        tests/unit/test_config.cpp
         tests/unit/test_spsc_queue.cpp
         tests/unit/test_broker.cpp
         tests/unit/test_handles.cpp
@@ -88,7 +110,16 @@ endif()
 
 # Benchmarks
 if(OMNI_BUILD_BENCHMARKS)
-    find_package(benchmark REQUIRED)
+    # Fetch Google Benchmark
+    FetchContent_Declare(
+        benchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG v1.9.1
+        GIT_SHALLOW TRUE
+    )
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(benchmark)
     
     add_executable(bench-throughput bench/throughput_latency.cpp)
     target_link_libraries(bench-throughput PRIVATE
