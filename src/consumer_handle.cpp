@@ -149,9 +149,35 @@ ConsumerHandle::ConsumerHandle(ConsumerHandle&&) noexcept = default;
 ConsumerHandle& ConsumerHandle::operator=(ConsumerHandle&&) noexcept = default;
 
 std::pair<PopResult, std::optional<ConsumerHandle::Message>> ConsumerHandle::BlockingPop(
-    std::chrono::milliseconds /*timeout*/) noexcept {
-    // TODO: Implement BlockingPop
-    return {PopResult::Timeout, std::nullopt};
+    std::chrono::milliseconds timeout) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    
+    while (true) {
+        // 1. Try non-blocking pop
+        auto [result, msg] = TryPop();
+        
+        if (result == PopResult::Success || result == PopResult::ChannelClosed) {
+            return {result, std::move(msg)};
+        }
+        
+        // 2. Check timeout
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            pimpl_->statistics.failed_pops++;
+            return {PopResult::Timeout, std::nullopt};
+        }
+        
+        // 3. Wait for notification (with spurious wakeup protection)
+        const uint64_t current_write = pimpl_->queue->write_index.load(std::memory_order_acquire);
+        const uint64_t current_read = pimpl_->queue->read_index.load(std::memory_order_relaxed);
+        
+        if (current_write != current_read) {
+            continue;  // Data arrived, retry
+        }
+        
+        // Wait until write_index changes OR timeout
+        pimpl_->queue->write_index.wait(current_write, std::memory_order_acquire);
+    }
 }
 
 std::pair<PopResult, std::vector<ConsumerHandle::Message>> ConsumerHandle::BatchPop(
