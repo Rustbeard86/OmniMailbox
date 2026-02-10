@@ -108,8 +108,9 @@ public:
     ProducerHandle& operator=(const ProducerHandle&) = delete;
 
 private:
-    friend class MailboxBroker;
-    explicit ProducerHandle(std::shared_ptr<detail::SPSCQueue> queue);
+friend class MailboxBroker;
+friend class ProducerHandleTestFixture;  // For testing
+explicit ProducerHandle(std::shared_ptr<detail::SPSCQueue> queue);
     
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

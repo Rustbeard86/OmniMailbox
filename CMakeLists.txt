@@ -8,8 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Options
 option(OMNI_BUILD_TESTS "Build unit tests" ON)
-option(OMNI_BUILD_EXAMPLES "Build examples" ON)
-option(OMNI_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(OMNI_BUILD_EXAMPLES "Build examples" OFF)
+option(OMNI_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(OMNI_ENABLE_SANITIZERS "Enable ASAN/TSAN/UBSAN" OFF)
 option(OMNI_HEADER_ONLY "Header-only mode" OFF)
 
