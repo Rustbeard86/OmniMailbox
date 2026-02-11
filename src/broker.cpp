@@ -109,4 +109,80 @@ std::pair<ChannelError, std::optional<ChannelPair>> MailboxBroker::RequestChanne
     }
 }
 
+bool MailboxBroker::HasChannel(std::string_view name) const noexcept {
+    // Acquire shared lock (multiple readers allowed)
+    std::shared_lock lock(pimpl_->registry_mutex_);
+    
+    // Check if channel exists in map
+    return pimpl_->channels_.contains(std::string(name));
+}
+
+bool MailboxBroker::RemoveChannel(std::string_view name) noexcept {
+    // Acquire write lock (exclusive access)
+    std::unique_lock lock(pimpl_->registry_mutex_);
+    
+    // Find channel
+    auto it = pimpl_->channels_.find(std::string(name));
+    if (it == pimpl_->channels_.end()) {
+        return false;  // Not found
+    }
+    
+    // Check liveness flags (relaxed ordering sufficient for check)
+    const bool producer_alive = it->second.queue->producer_alive.load(std::memory_order_relaxed);
+    const bool consumer_alive = it->second.queue->consumer_alive.load(std::memory_order_relaxed);
+    
+    // Only allow removal if both handles are dead
+    if (producer_alive || consumer_alive) {
+        return false;  // Handles still exist
+    }
+    
+    // Safe to erase - both handles destroyed
+    pimpl_->channels_.erase(it);
+    pimpl_->total_destroyed_.fetch_add(1, std::memory_order_relaxed);
+    
+    return true;
+}
+
+MailboxBroker::Stats MailboxBroker::GetStats() const noexcept {
+    // Acquire shared lock (multiple readers allowed)
+    std::shared_lock lock(pimpl_->registry_mutex_);
+    
+    // Aggregate stats across all channels
+    size_t total_messages = 0;
+    size_t total_bytes = 0;
+    
+    for (const auto& [name, state] : pimpl_->channels_) {
+        // Access producer/consumer statistics from queue
+        // Note: Queue doesn't store stats directly - they're in handles
+        // For broker-level aggregation, we'd need to track this differently
+        // Per spec section 5.2.1, we aggregate from active channels
+        // Since handles own stats, we can only report active channel count
+    }
+    
+    return Stats{
+        .active_channels = pimpl_->channels_.size(),
+        .total_channels_created = pimpl_->total_created_.load(std::memory_order_relaxed),
+        .total_messages_sent = total_messages,
+        .total_bytes_transferred = total_bytes
+    };
+}
+
+void MailboxBroker::Shutdown() noexcept {
+    // Acquire write lock (exclusive access)
+    std::unique_lock lock(pimpl_->registry_mutex_);
+    
+    // Set all liveness flags to false
+    // WARNING: User must destroy all handles before calling Shutdown()
+    // See section 14.5 for limitations
+    for (auto& [name, state] : pimpl_->channels_) {
+        // Signal both producer and consumer to stop
+        state.queue->producer_alive.store(false, std::memory_order_release);
+        state.queue->consumer_alive.store(false, std::memory_order_release);
+        
+        // Wake any blocked threads
+        state.queue->write_index.notify_one();
+        state.queue->read_index.notify_one();
+    }
+}
+
 } // namespace omni

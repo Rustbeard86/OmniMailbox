@@ -241,10 +241,20 @@ public:
     [[nodiscard]] Stats GetStats() const noexcept;
     
     /**
-     * @brief Shutdown all channels (blocks until all handles released).
+     * @brief Shutdown all channels (signals stop, does NOT wait).
      * 
-     * Signals all channels to stop accepting new operations. Blocks until
-     * all producer and consumer handles are destroyed.
+     * Sets all producer_alive and consumer_alive flags to false across
+     * all registered channels. This causes any blocking operations to
+     * return with appropriate error codes and prevents new operations
+     * from succeeding.
+     * 
+     * @par Limitations (Section 14.5)
+     * This method does NOT block waiting for handle destructors.
+     * It only signals shutdown by setting liveness flags. Handles
+     * may continue to exist after Shutdown() returns.
+     * 
+     * User must ensure handles are destroyed before calling Shutdown()
+     * to avoid undefined behavior with subsequent operations.
      * 
      * @par Thread Safety
      * Uses shared_mutex (write lock).
@@ -253,16 +263,29 @@ public:
      * DO NOT call while holding channel handles in the same thread.
      * Ensure all handles are destroyed before calling Shutdown().
      * 
+     * @par Usage Pattern
      * INCORRECT:
+     * @code
      *   auto [error, channel] = broker.RequestChannel("test");
-     *   broker.Shutdown();  // BAD - Deadlock! channel still alive
+     *   broker.Shutdown();  // BAD - Handles still alive!
+     *   // Undefined behavior if handles used after this point
+     * @endcode
      * 
      * CORRECT:
+     * @code
      *   {
      *       auto [error, channel] = broker.RequestChannel("test");
      *       // Use channel
      *   }  // channel destroyed here
      *   broker.Shutdown();  // GOOD - Safe to shutdown
+     * @endcode
+     * 
+     * @par Implementation Note
+     * Current design sets liveness flags but doesn't wait for destructors.
+     * This is acceptable for v1.0 as it avoids complex synchronization.
+     * Future versions may add blocking behavior if needed.
+     * 
+     * @see Section 14.5 "Shutdown() Limitations" in design specification
      */
     void Shutdown() noexcept;
 

@@ -107,4 +107,99 @@ TEST(BrokerTest, RequestChannelInvalidConfig) {
     EXPECT_EQ(channel4->producer.GetConfig().max_message_size, 1'048'576);  // Clamped to maximum
 }
 
+// Test HasChannel method
+TEST(BrokerTest, HasChannel) {
+    auto& broker = omni::MailboxBroker::Instance();
+    
+    // Check non-existent channel
+    EXPECT_FALSE(broker.HasChannel("test-has-channel-nonexistent"));
+    
+    // Create channel
+    auto [error, channel] = broker.RequestChannel("test-has-channel-exists", {
+        .capacity = 512,
+        .max_message_size = 1024
+    });
+    
+    ASSERT_EQ(error, omni::ChannelError::Success);
+    ASSERT_TRUE(channel.has_value());
+    
+    // Check existing channel
+    EXPECT_TRUE(broker.HasChannel("test-has-channel-exists"));
+}
+
+// Test RemoveChannel with active handles (should fail)
+TEST(BrokerTest, RemoveChannelActive) {
+    auto& broker = omni::MailboxBroker::Instance();
+    
+    // Create channel with active handles
+    auto [error, channel] = broker.RequestChannel("test-remove-active", {
+        .capacity = 512,
+        .max_message_size = 1024
+    });
+    
+    ASSERT_EQ(error, omni::ChannelError::Success);
+    ASSERT_TRUE(channel.has_value());
+    
+    // Attempt to remove while handles are alive
+    EXPECT_FALSE(broker.RemoveChannel("test-remove-active"));
+    
+    // Channel should still exist
+    EXPECT_TRUE(broker.HasChannel("test-remove-active"));
+}
+
+// Test RemoveChannel with inactive handles (should succeed)
+TEST(BrokerTest, RemoveChannelInactive) {
+    auto& broker = omni::MailboxBroker::Instance();
+    
+    // Create channel in inner scope so handles are destroyed
+    {
+        auto [error, channel] = broker.RequestChannel("test-remove-inactive", {
+            .capacity = 512,
+            .max_message_size = 1024
+        });
+        
+        ASSERT_EQ(error, omni::ChannelError::Success);
+        ASSERT_TRUE(channel.has_value());
+    } // Handles destroyed here
+    
+    // Now both handles are dead, removal should succeed
+    EXPECT_TRUE(broker.RemoveChannel("test-remove-inactive"));
+    
+    // Channel should no longer exist
+    EXPECT_FALSE(broker.HasChannel("test-remove-inactive"));
+    
+    // Removing again should fail (not found)
+    EXPECT_FALSE(broker.RemoveChannel("test-remove-inactive"));
+}
+
+// Test GetStats method
+TEST(BrokerTest, GetStats) {
+    auto& broker = omni::MailboxBroker::Instance();
+    
+    // Get baseline stats
+    auto stats_before = broker.GetStats();
+    size_t channels_before = stats_before.active_channels;
+    size_t created_before = stats_before.total_channels_created;
+    
+    // Create a new channel
+    auto [error, channel] = broker.RequestChannel("test-stats-channel", {
+        .capacity = 512,
+        .max_message_size = 1024
+    });
+    
+    ASSERT_EQ(error, omni::ChannelError::Success);
+    ASSERT_TRUE(channel.has_value());
+    
+    // Get stats after creation
+    auto stats_after = broker.GetStats();
+    
+    // Verify active_channels increased by 1
+    EXPECT_EQ(stats_after.active_channels, channels_before + 1);
+    
+    // Verify total_channels_created increased by 1
+    EXPECT_EQ(stats_after.total_channels_created, created_before + 1);
+}
+
+
+
 
