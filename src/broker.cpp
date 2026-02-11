@@ -20,6 +20,15 @@ struct MailboxBroker::Impl {
     std::atomic<size_t> total_destroyed_{0};
 };
 
+// Constructor - Initialize pimpl
+MailboxBroker::MailboxBroker()
+    : pimpl_(std::make_unique<Impl>())
+{
+}
+
+// Destructor - Required for unique_ptr<Impl> with forward-declared Impl
+MailboxBroker::~MailboxBroker() = default;
+
 // Singleton instance implementation
 MailboxBroker& MailboxBroker::Instance() noexcept {
     // INTENTIONAL MEMORY LEAK - Static Destruction Order Fiasco Prevention
@@ -44,6 +53,60 @@ MailboxBroker& MailboxBroker::Instance() noexcept {
     // Reference: Design Specification Section 14.1 "Singleton Lifetime"
     static MailboxBroker* instance = new MailboxBroker();
     return *instance;
+}
+
+std::pair<ChannelError, std::optional<ChannelPair>> MailboxBroker::RequestChannel(
+    std::string_view name,
+    const ChannelConfig& config) noexcept
+{
+    // 1. Validate config using IsValid() - check user-provided config first
+    // Note: IsValid() requires power-of-2 capacity, so we normalize first if needed
+    ChannelConfig normalized = config.Normalize();
+    
+    // After normalization, validate the normalized config
+    if (!normalized.IsValid()) {
+        return {ChannelError::InvalidConfig, std::nullopt};
+    }
+    
+    // 3. Acquire write lock (unique_lock for exclusive access)
+    std::unique_lock lock(pimpl_->registry_mutex_);
+    
+    // 4. Check if channel exists (return NameExists if found)
+    if (pimpl_->channels_.contains(std::string(name))) {
+        return {ChannelError::NameExists, std::nullopt};
+    }
+    
+    // 5. Try to create queue (catch bad_alloc, return AllocationFailed)
+    try {
+        auto queue = std::make_shared<detail::SPSCQueue>(
+            normalized.capacity,
+            normalized.max_message_size
+        );
+        
+        // 6. Store ChannelState in map
+        Impl::ChannelState state{
+            .queue = queue,
+            .name = std::string(name),
+            .created_at = std::chrono::steady_clock::now()
+        };
+        
+        pimpl_->channels_.emplace(state.name, std::move(state));
+        
+        // 7. Increment total_created counter (relaxed ordering for stats)
+        pimpl_->total_created_.fetch_add(1, std::memory_order_relaxed);
+        
+        // 8. Create ProducerHandle and ConsumerHandle
+        // Both handles reference the same queue
+        ProducerHandle producer(queue);
+        ConsumerHandle consumer(queue);
+        
+        // 9. Return {Success, ChannelPair{producer, consumer}}
+        return {ChannelError::Success, ChannelPair{std::move(producer), std::move(consumer)}};
+        
+    } catch (const std::bad_alloc&) {
+        // Memory allocation failed
+        return {ChannelError::AllocationFailed, std::nullopt};
+    }
 }
 
 } // namespace omni

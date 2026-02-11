@@ -268,10 +268,10 @@ public:
 
 private:
     // Private constructor (singleton pattern)
-    MailboxBroker() = default;
+    MailboxBroker();
     
     // Private destructor (singleton pattern)
-    ~MailboxBroker() = default;
+    ~MailboxBroker();
     
     // Non-copyable, non-movable
     MailboxBroker(const MailboxBroker&) = delete;
