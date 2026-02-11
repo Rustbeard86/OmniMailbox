@@ -100,8 +100,8 @@ public:
     ConsumerHandle(const ConsumerHandle&) = delete;
     ConsumerHandle& operator=(const ConsumerHandle&) = delete;
 
-#ifndef NDEBUG
-    // ===== TEST-ONLY METHODS (Debug builds only) =====
+#if !defined(NDEBUG) || defined(OMNI_ENABLE_TESTING)
+    // ===== TEST-ONLY METHODS (Debug builds or when OMNI_ENABLE_TESTING is defined) =====
     // WARNING: These methods expose internal state for testing.
     // Do NOT use in production code.
     

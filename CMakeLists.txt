@@ -71,6 +71,11 @@ else()
     )
     target_link_libraries(omni-mailbox PUBLIC flatbuffers)
     add_dependencies(omni-mailbox generate_flatbuffers)
+    
+    # Enable testing methods when building tests
+    if(OMNI_BUILD_TESTS)
+        target_compile_definitions(omni-mailbox PUBLIC OMNI_ENABLE_TESTING)
+    endif()
 endif()
 
 # Compiler warnings (strict)

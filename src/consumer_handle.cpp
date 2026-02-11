@@ -48,8 +48,8 @@ ConsumerHandle::ConsumerHandle(std::shared_ptr<detail::SPSCQueue> queue)
 {
 }
 
-#ifndef NDEBUG
-// Test-only factory method (debug builds only)
+#if !defined(NDEBUG) || defined(OMNI_ENABLE_TESTING)
+// Test-only factory method (debug builds or when OMNI_ENABLE_TESTING is defined)
 ConsumerHandle ConsumerHandle::CreateForTesting_(std::shared_ptr<detail::SPSCQueue> queue) {
     return ConsumerHandle(std::move(queue));
 }
