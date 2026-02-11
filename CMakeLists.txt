@@ -89,6 +89,7 @@ if(OMNI_BUILD_TESTS)
         tests/unit/test_spsc_queue.cpp
         tests/unit/test_broker.cpp
         tests/unit/test_handles.cpp
+        tests/unit/test_consumer_handle.cpp
         tests/integration/test_end_to_end.cpp
     )
     target_link_libraries(omni-tests PRIVATE
