@@ -105,8 +105,12 @@ if(OMNI_BUILD_EXAMPLES)
     add_executable(example-basic examples/basic_usage.cpp)
     target_link_libraries(example-basic PRIVATE omni-mailbox)
     
-    add_executable(example-flatbuffers examples/flatbuffers_telemetry.cpp)
-    target_link_libraries(example-flatbuffers PRIVATE omni-mailbox)
+    add_executable(example-backpressure examples/backpressure_demo.cpp)
+    target_link_libraries(example-backpressure PRIVATE omni-mailbox)
+    
+    # TODO: Create flatbuffers example
+    # add_executable(example-flatbuffers examples/flatbuffers_telemetry.cpp)
+    # target_link_libraries(example-flatbuffers PRIVATE omni-mailbox)
 endif()
 
 # Benchmarks
