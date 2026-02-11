@@ -1,0 +1,14 @@
+// example_message.fbs
+namespace omni.example;
+
+enum Priority : byte { Low = 0, Medium = 1, High = 2 }
+
+table Telemetry {
+    timestamp: uint64;
+    sensor_id: string;
+    temperature: float;
+    pressure: float;
+    priority: Priority = Medium;
+}
+
+root_type Telemetry;

@@ -34,6 +34,27 @@ set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FLATBUFFERS_BUILD_FLATC ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(flatbuffers)
 
+# Compile FlatBuffers schemas
+set(FLATBUFFERS_SCHEMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/schemas")
+set(FLATBUFFERS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+file(MAKE_DIRECTORY ${FLATBUFFERS_GENERATED_DIR})
+
+# Generate C++ header from schema
+add_custom_command(
+    OUTPUT "${FLATBUFFERS_GENERATED_DIR}/example_message_generated.h"
+    COMMAND flatc --cpp -o "${FLATBUFFERS_GENERATED_DIR}" 
+            "${FLATBUFFERS_SCHEMA_DIR}/example_message.fbs"
+    DEPENDS "${FLATBUFFERS_SCHEMA_DIR}/example_message.fbs" flatc
+    COMMENT "Compiling FlatBuffers schema: example_message.fbs"
+    VERBATIM
+)
+
+# Create a target that depends on the generated header
+add_custom_target(generate_flatbuffers
+    DEPENDS "${FLATBUFFERS_GENERATED_DIR}/example_message_generated.h"
+)
+
 # Library target
 if(OMNI_HEADER_ONLY)
     add_library(omni-mailbox INTERFACE)
@@ -44,8 +65,12 @@ else()
         src/producer_handle.cpp
         src/consumer_handle.cpp
     )
-    target_include_directories(omni-mailbox PUBLIC include/)
+    target_include_directories(omni-mailbox PUBLIC 
+        include/
+        ${FLATBUFFERS_GENERATED_DIR}
+    )
     target_link_libraries(omni-mailbox PUBLIC flatbuffers)
+    add_dependencies(omni-mailbox generate_flatbuffers)
 endif()
 
 # Compiler warnings (strict)
